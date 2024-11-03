@@ -1,0 +1,13 @@
+[package]
+name = "goldsmith-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.20", features = ["derive"] }
+eyre = "0.6.12"
+rayon = "1.10.0"
+realfft = "3.4.0"
+rodio = "0.19.0"
+tokio = { version = "1.41.0", features = ["full", "tracing"] }
+tracing = { version = "0.1.40", features = ["log"] }
