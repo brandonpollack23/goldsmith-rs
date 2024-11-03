@@ -46,7 +46,7 @@ mod audio {
     use std::time::Duration;
     use std::{fs::File, io::BufReader};
     use tokio::sync::mpsc::Receiver;
-    use tracing::info;
+    
 
     #[derive(Clone, Debug)]
     pub struct FFTWindow {
@@ -73,7 +73,7 @@ mod audio {
         let decoder_clone = decoder.clone();
         rayon::spawn(move || {
             let mut planner = RealFftPlanner::<f64>::new();
-            let fft = planner.plan_fft_forward(fft_window_size as usize);
+            let fft = planner.plan_fft_forward(fft_window_size);
 
             let mut fft_window_buf: Vec<f64> = vec![];
             for sample in decoder_clone {
@@ -85,7 +85,7 @@ mod audio {
 
                     let window = output
                         .iter()
-                        .map(|&x| f64::sqrt((x.re * x.re + x.im * x.im) as f64))
+                        .map(|&x| f64::sqrt(x.re * x.re + x.im * x.im))
                         .collect::<Vec<f64>>();
                     fft_chan_tx
                         .blocking_send(FFTWindow { window })
