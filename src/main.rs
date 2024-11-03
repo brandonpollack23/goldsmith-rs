@@ -1,6 +1,8 @@
 use clap::Parser;
 use eyre::Result;
 use rodio::{OutputStream, Sink};
+use tracing::{info, Level};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -15,13 +17,15 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
+
     let args = Args::parse();
 
     let (decoder, mut window_chan_rx) =
         audio::prepare_fft_decoder(&args.audio_file, args.target_fps)?;
     let visualizer = tokio::spawn(async move {
         while let Some(fft_window) = window_chan_rx.recv().await {
-            println!("{:?}", fft_window.window);
+            info!("{:?}", fft_window.window);
         }
     });
 
@@ -36,6 +40,28 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn init_tracing() {
+    // Console layer for tokio-console
+    let console_layer = console_subscriber::ConsoleLayer::builder().spawn(); // spawns the console server in a background task
+
+    // Fmt layer for human-readable logging
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(true) // Include target (module path) in logs
+        .with_level(true); // Include log levels
+
+    // Create an EnvFilter layer to control log verbosity
+    let filter_layer = tracing_subscriber::EnvFilter::builder()
+        .with_default_directive(Level::INFO.into()) // Set default level to INFO
+        .from_env_lossy(); // Also use RUST_LOG env if set
+
+    // Combine layers and set global default
+    tracing_subscriber::registry()
+        .with(console_layer)
+        .with(fmt_layer)
+        .with(filter_layer)
+        .init();
+}
+
 mod audio {
     use eyre::Result;
     use realfft::num_complex::Complex;
@@ -43,10 +69,10 @@ mod audio {
     use rodio::source::Buffered;
     use rodio::Decoder;
     use rodio::Source;
+    use tracing::info;
     use std::time::Duration;
     use std::{fs::File, io::BufReader};
     use tokio::sync::mpsc::Receiver;
-    
 
     #[derive(Clone, Debug)]
     pub struct FFTWindow {
@@ -61,11 +87,12 @@ mod audio {
         let decoder = Decoder::new(audio_file)?.buffered();
 
         let window_duration = Duration::from_secs(1) / target_fps;
-        println!("FFT Window duration is {window_duration:?}");
         let fft_window_size =
             ((decoder.sample_rate() as f64) * window_duration.as_secs_f64()) as usize;
-        println!("FFT sample rate is {}", decoder.sample_rate());
-        println!("FFT Window Size is {fft_window_size}");
+
+        info!("FFT Window duration is {window_duration:?}");
+        info!("FFT sample rate is {}", decoder.sample_rate());
+        info!("FFT Window Size is {fft_window_size}");
         // let _song_duration = decoder.total_duration().unwrap();
 
         // fftStreamer := fft.NewFFTStreamer(ctx, streamer, fftWindowSize, format)
