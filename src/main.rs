@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{io::Stdout, time::Duration};
 
 use clap::Parser;
 use crossterm::{
@@ -10,12 +10,15 @@ use itertools::Itertools;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     prelude::CrosstermBackend,
+    style::Color,
     widgets::{Block, Borders, Gauge},
     Terminal,
 };
 use rodio::{OutputStream, Sink};
 use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+
+mod audio;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -41,64 +44,10 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
-    let (decoder, mut window_chan_rx) =
+    let (decoder, window_chan_rx) =
         audio::prepare_fft_decoder(&config.audio_file, config.target_fps)?;
     let visualizer = tokio::spawn(async move {
-        while let Some(fft_window) = window_chan_rx.recv().await {
-            let bucket_size = usize::div_ceil(fft_window.window.len(), config.num_buckets as usize);
-            let mut buckets: Vec<f64> = fft_window
-                .window
-                .iter()
-                .chunks(bucket_size)
-                .into_iter()
-                .map(|b| b.sum::<f64>())
-                .collect();
-            let max_bucket = *buckets
-                .iter()
-                .max_by(|a, b| a.partial_cmp(b).unwrap())
-                .unwrap();
-
-            // Normalize buckets
-            if max_bucket != 0.0 {
-                for bucket in &mut buckets {
-                    *bucket /= max_bucket;
-                }
-            }
-
-            terminal
-                .draw(|f| {
-                    let chunks = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints(
-                            (0..config.num_buckets)
-                                .map(|_| Constraint::Percentage(100 / config.num_buckets as u16))
-                                .collect::<Vec<_>>(),
-                        )
-                        .split(f.area());
-
-                    for (i, &bucket) in buckets.iter().enumerate() {
-                        let gauge = Gauge::default()
-                            .block(Block::default().borders(Borders::ALL))
-                            .gauge_style(
-                                ratatui::style::Style::default().fg(ratatui::style::Color::White),
-                            )
-                            .ratio(bucket);
-                        f.render_widget(gauge, chunks[i]);
-                    }
-                })
-                .expect("error drawing terminal");
-
-            if event::poll(Duration::from_millis(0)).expect("error polling event") {
-                if let Event::Key(key) = event::read().expect("error reading event") {
-                    if key.code == KeyCode::Char('q')
-                        || (key.modifiers.contains(KeyModifiers::CONTROL)
-                            && key.code == KeyCode::Char('c'))
-                    {
-                        return;
-                    }
-                }
-            }
-        }
+        visualizer_loop(&config, &mut terminal, window_chan_rx).await;
     });
 
     let (_stream, stream_handle) =
@@ -135,68 +84,68 @@ fn init_tracing() {
         .init();
 }
 
-mod audio {
-    use eyre::Result;
-    use realfft::num_complex::Complex;
-    use realfft::RealFftPlanner;
-    use rodio::source::Buffered;
-    use rodio::Decoder;
-    use rodio::Source;
-    use std::time::Duration;
-    use std::{fs::File, io::BufReader};
-    use tokio::sync::mpsc::Receiver;
-    use tracing::debug;
+async fn visualizer_loop(
+    config: &Config,
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    mut window_chan_rx: tokio::sync::mpsc::Receiver<audio::FFTWindow>,
+) {
+    while let Some(fft_window) = window_chan_rx.recv().await {
+        let bucket_size = usize::div_ceil(fft_window.window.len(), config.num_buckets as usize);
+        let mut buckets: Vec<f64> = fft_window
+            .window
+            .iter()
+            .chunks(bucket_size)
+            .into_iter()
+            .map(|b| b.sum::<f64>())
+            .collect();
+        let max_bucket = *buckets
+            .iter()
+            .max_by(|a, b| a.partial_cmp(b).unwrap())
+            .unwrap();
 
-    #[derive(Clone, Debug)]
-    pub struct FFTWindow {
-        pub window: Vec<f64>,
-    }
+        // Normalize buckets
+        if max_bucket != 0.0 {
+            for bucket in &mut buckets {
+                *bucket /= max_bucket;
+            }
+        }
 
-    pub fn prepare_fft_decoder(
-        audio_file_str: &str,
-        target_fps: u32,
-    ) -> Result<(Buffered<Decoder<BufReader<File>>>, Receiver<FFTWindow>)> {
-        let audio_file = BufReader::new(File::open(audio_file_str)?);
-        let decoder = Decoder::new(audio_file)?.buffered();
+        terminal
+            .draw(|f| {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(
+                        (0..config.num_buckets)
+                            .map(|_| Constraint::Percentage(100 / config.num_buckets as u16))
+                            .collect::<Vec<_>>(),
+                    )
+                    .split(f.area());
 
-        let window_duration = Duration::from_secs(1) / target_fps;
-        let fft_window_size =
-            ((decoder.sample_rate() as f64) * window_duration.as_secs_f64()) as usize;
+                for (i, &bucket) in buckets.iter().enumerate() {
+                    let gauge = Gauge::default()
+                        .block(Block::default().borders(Borders::ALL))
+                        .gauge_style(ratatui::style::Style::default().fg(color_gradient(bucket)))
+                        .ratio(bucket);
+                    f.render_widget(gauge, chunks[i]);
+                }
+            })
+            .expect("error drawing terminal");
 
-        debug!("FFT Window duration is {window_duration:?}");
-        debug!("FFT sample rate is {}", decoder.sample_rate());
-        debug!("FFT Window Size is {fft_window_size}");
-        // let _song_duration = decoder.total_duration().unwrap();
-
-        // fftStreamer := fft.NewFFTStreamer(ctx, streamer, fftWindowSize, format)
-        let (fft_chan_tx, fft_chan_rx) = tokio::sync::mpsc::channel::<FFTWindow>(10);
-        let decoder_clone = decoder.clone();
-        rayon::spawn(move || {
-            let mut planner = RealFftPlanner::<f64>::new();
-            let fft = planner.plan_fft_forward(fft_window_size);
-
-            let mut fft_window_buf: Vec<f64> = vec![];
-            for sample in decoder_clone {
-                fft_window_buf.push(sample as f64);
-                if fft_window_buf.len() == fft_window_size {
-                    let mut output = vec![Complex::<f64>::new(0.0, 0.0); fft_window_size / 2 + 1];
-                    fft.process(&mut fft_window_buf, &mut output).unwrap();
-
-                    let window = output
-                        .iter()
-                        .take(output.len() / 2) // Ignore negative frequency half
-                        .map(|&x| f64::sqrt(x.re * x.re + x.im * x.im))
-                        .collect::<Vec<f64>>();
-                    if let Err(_) = fft_chan_tx.blocking_send(FFTWindow { window }) {
-                        debug!("channel closed, stopping fft");
-                        return;
-                    }
-
-                    fft_window_buf.clear();
+        if event::poll(Duration::from_millis(0)).expect("error polling event") {
+            if let Event::Key(key) = event::read().expect("error reading event") {
+                if key.code == KeyCode::Char('q')
+                    || (key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('c'))
+                {
+                    return;
                 }
             }
-        });
-
-        Ok((decoder, fft_chan_rx))
+        }
     }
+}
+
+fn color_gradient(value: f64) -> Color {
+    let r = (255.0 * value) as u8;
+    let g = (255.0 * (1.0 - value)) as u8;
+    Color::Rgb(r, g, 0)
 }
