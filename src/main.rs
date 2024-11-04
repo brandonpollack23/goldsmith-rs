@@ -7,19 +7,24 @@ use crossterm::{
 };
 use eyre::Result;
 use itertools::Itertools;
-use ratatui::{prelude::CrosstermBackend, Terminal};
+use ratatui::{
+    layout::{Constraint, Direction, Layout},
+    prelude::CrosstermBackend,
+    widgets::{Block, Borders, Gauge},
+    Terminal,
+};
 use rodio::{OutputStream, Sink};
 use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
-struct Args {
+struct Config {
     /// Target frames per second
     #[clap(short, long, default_value_t = 30)]
     target_fps: u32,
 
-    #[clap(short, long, default_value_t = 8)]
+    #[clap(short, long, default_value_t = 16)]
     num_buckets: u32,
 
     /// Audio file to process
@@ -30,17 +35,17 @@ struct Args {
 async fn main() -> Result<()> {
     init_tracing();
 
-    let args = Args::parse();
+    let config = Config::parse();
 
     enable_raw_mode()?;
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let (decoder, mut window_chan_rx) =
-        audio::prepare_fft_decoder(&args.audio_file, args.target_fps)?;
+        audio::prepare_fft_decoder(&config.audio_file, config.target_fps)?;
     let visualizer = tokio::spawn(async move {
         while let Some(fft_window) = window_chan_rx.recv().await {
-            let bucket_size = fft_window.window.len() / args.num_buckets as usize;
+            let bucket_size = usize::div_ceil(fft_window.window.len(), config.num_buckets as usize);
             let mut buckets: Vec<f64> = fft_window
                 .window
                 .iter()
@@ -52,34 +57,36 @@ async fn main() -> Result<()> {
                 .iter()
                 .max_by(|a, b| a.partial_cmp(b).unwrap())
                 .unwrap();
-            for bucket in &mut buckets {
-                *bucket /= max_bucket;
+
+            // Normalize buckets
+            if max_bucket != 0.0 {
+                for bucket in &mut buckets {
+                    *bucket /= max_bucket;
+                }
             }
 
-            // terminal.draw(|f| {
-            //     let chunks = Layout::default()
-            //         .direction(Direction::Vertical)
-            //         .constraints(
-            //             (0..16)
-            //                 .map(|_| Constraint::Percentage(100 / 16))
-            //                 .collect::<Vec<_>>(),
-            //         )
-            //         .split(f.area());
-            //
-            //     for (i, &bucket) in buckets.iter().enumerate() {
-            //         let gauge = Gauge::default()
-            //             .block(
-            //                 Block::default()
-            //                     .borders(Borders::ALL)
-            //                     .title(format!("Bucket {}", i + 1)),
-            //             )
-            //             .gauge_style(
-            //                 ratatui::style::Style::default().fg(ratatui::style::Color::White),
-            //             )
-            //             .ratio(bucket);
-            //         f.render_widget(gauge, chunks[i]);
-            //     }
-            // }).expect("error drawing terminal");
+            terminal
+                .draw(|f| {
+                    let chunks = Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints(
+                            (0..config.num_buckets)
+                                .map(|_| Constraint::Percentage(100 / config.num_buckets as u16))
+                                .collect::<Vec<_>>(),
+                        )
+                        .split(f.area());
+
+                    for (i, &bucket) in buckets.iter().enumerate() {
+                        let gauge = Gauge::default()
+                            .block(Block::default().borders(Borders::ALL))
+                            .gauge_style(
+                                ratatui::style::Style::default().fg(ratatui::style::Color::White),
+                            )
+                            .ratio(bucket);
+                        f.render_widget(gauge, chunks[i]);
+                    }
+                })
+                .expect("error drawing terminal");
 
             if event::poll(Duration::from_millis(0)).expect("error polling event") {
                 if let Event::Key(key) = event::read().expect("error reading event") {
@@ -177,6 +184,7 @@ mod audio {
 
                     let window = output
                         .iter()
+                        .take(output.len() / 2) // Ignore negative frequency half
                         .map(|&x| f64::sqrt(x.re * x.re + x.im * x.im))
                         .collect::<Vec<f64>>();
                     if let Err(_) = fft_chan_tx.blocking_send(FFTWindow { window }) {
