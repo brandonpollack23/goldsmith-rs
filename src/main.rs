@@ -1,8 +1,10 @@
+use std::time::Duration;
+
 use clap::Parser;
 use eyre::Result;
 use rodio::{OutputStream, Sink};
 use tracing::{info, Level};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -47,18 +49,17 @@ fn init_tracing() {
     // Fmt layer for human-readable logging
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true) // Include target (module path) in logs
-        .with_level(true); // Include log levels
-
-    // Create an EnvFilter layer to control log verbosity
-    let filter_layer = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(Level::INFO.into()) // Set default level to INFO
-        .from_env_lossy(); // Also use RUST_LOG env if set
+        .with_level(true) // Include log levels
+        .with_filter(
+            tracing_subscriber::EnvFilter::builder()
+                .with_default_directive(Level::INFO.into()) // Set default level to INFO
+                .from_env_lossy(),
+        );
 
     // Combine layers and set global default
     tracing_subscriber::registry()
         .with(console_layer)
         .with(fmt_layer)
-        .with(filter_layer)
         .init();
 }
 
@@ -69,10 +70,10 @@ mod audio {
     use rodio::source::Buffered;
     use rodio::Decoder;
     use rodio::Source;
-    use tracing::info;
     use std::time::Duration;
     use std::{fs::File, io::BufReader};
     use tokio::sync::mpsc::Receiver;
+    use tracing::info;
 
     #[derive(Clone, Debug)]
     pub struct FFTWindow {
