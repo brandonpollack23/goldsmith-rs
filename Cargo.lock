@@ -723,6 +723,7 @@ dependencies = [
  "console-subscriber",
  "crossterm",
  "eyre",
+ "itertools",
  "ratatui",
  "rayon",
  "realfft",

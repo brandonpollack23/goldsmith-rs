@@ -1,9 +1,15 @@
 use std::time::Duration;
 
 use clap::Parser;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyModifiers},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use eyre::Result;
+use itertools::Itertools;
+use ratatui::{prelude::CrosstermBackend, Terminal};
 use rodio::{OutputStream, Sink};
-use tracing::{info, Level};
+use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 #[derive(Parser, Debug)]
@@ -12,6 +18,9 @@ struct Args {
     /// Target frames per second
     #[clap(short, long, default_value_t = 30)]
     target_fps: u32,
+
+    #[clap(short, long, default_value_t = 8)]
+    num_buckets: u32,
 
     /// Audio file to process
     audio_file: String,
@@ -23,11 +32,65 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    enable_raw_mode()?;
+    let backend = CrosstermBackend::new(std::io::stdout());
+    let mut terminal = Terminal::new(backend)?;
+
     let (decoder, mut window_chan_rx) =
         audio::prepare_fft_decoder(&args.audio_file, args.target_fps)?;
     let visualizer = tokio::spawn(async move {
         while let Some(fft_window) = window_chan_rx.recv().await {
-            info!("{:?}", fft_window.window);
+            let bucket_size = fft_window.window.len() / args.num_buckets as usize;
+            let mut buckets: Vec<f64> = fft_window
+                .window
+                .iter()
+                .chunks(bucket_size)
+                .into_iter()
+                .map(|b| b.sum::<f64>())
+                .collect();
+            let max_bucket = *buckets
+                .iter()
+                .max_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap();
+            for bucket in &mut buckets {
+                *bucket /= max_bucket;
+            }
+
+            // terminal.draw(|f| {
+            //     let chunks = Layout::default()
+            //         .direction(Direction::Vertical)
+            //         .constraints(
+            //             (0..16)
+            //                 .map(|_| Constraint::Percentage(100 / 16))
+            //                 .collect::<Vec<_>>(),
+            //         )
+            //         .split(f.area());
+            //
+            //     for (i, &bucket) in buckets.iter().enumerate() {
+            //         let gauge = Gauge::default()
+            //             .block(
+            //                 Block::default()
+            //                     .borders(Borders::ALL)
+            //                     .title(format!("Bucket {}", i + 1)),
+            //             )
+            //             .gauge_style(
+            //                 ratatui::style::Style::default().fg(ratatui::style::Color::White),
+            //             )
+            //             .ratio(bucket);
+            //         f.render_widget(gauge, chunks[i]);
+            //     }
+            // }).expect("error drawing terminal");
+
+            if event::poll(Duration::from_millis(0)).expect("error polling event") {
+                if let Event::Key(key) = event::read().expect("error reading event") {
+                    if key.code == KeyCode::Char('q')
+                        || (key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.code == KeyCode::Char('c'))
+                    {
+                        return;
+                    }
+                }
+            }
         }
     });
 
@@ -38,6 +101,8 @@ async fn main() -> Result<()> {
     sink.append(decoder);
 
     visualizer.await?;
+
+    disable_raw_mode()?;
 
     Ok(())
 }
@@ -73,7 +138,7 @@ mod audio {
     use std::time::Duration;
     use std::{fs::File, io::BufReader};
     use tokio::sync::mpsc::Receiver;
-    use tracing::info;
+    use tracing::debug;
 
     #[derive(Clone, Debug)]
     pub struct FFTWindow {
@@ -91,9 +156,9 @@ mod audio {
         let fft_window_size =
             ((decoder.sample_rate() as f64) * window_duration.as_secs_f64()) as usize;
 
-        info!("FFT Window duration is {window_duration:?}");
-        info!("FFT sample rate is {}", decoder.sample_rate());
-        info!("FFT Window Size is {fft_window_size}");
+        debug!("FFT Window duration is {window_duration:?}");
+        debug!("FFT sample rate is {}", decoder.sample_rate());
+        debug!("FFT Window Size is {fft_window_size}");
         // let _song_duration = decoder.total_duration().unwrap();
 
         // fftStreamer := fft.NewFFTStreamer(ctx, streamer, fftWindowSize, format)
@@ -106,7 +171,6 @@ mod audio {
             let mut fft_window_buf: Vec<f64> = vec![];
             for sample in decoder_clone {
                 fft_window_buf.push(sample as f64);
-                println!("{fft_window_buf:?}");
                 if fft_window_buf.len() == fft_window_size {
                     let mut output = vec![Complex::<f64>::new(0.0, 0.0); fft_window_size / 2 + 1];
                     fft.process(&mut fft_window_buf, &mut output).unwrap();
@@ -115,9 +179,10 @@ mod audio {
                         .iter()
                         .map(|&x| f64::sqrt(x.re * x.re + x.im * x.im))
                         .collect::<Vec<f64>>();
-                    fft_chan_tx
-                        .blocking_send(FFTWindow { window })
-                        .expect("failed to send fft");
+                    if let Err(_) = fft_chan_tx.blocking_send(FFTWindow { window }) {
+                        debug!("channel closed, stopping fft");
+                        return;
+                    }
 
                     fft_window_buf.clear();
                 }
